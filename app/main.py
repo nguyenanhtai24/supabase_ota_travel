@@ -23,11 +23,11 @@ app.add_middleware(
 
 # Đăng ký các router
 app.include_router(system.router)
+app.include_router(combo.router, dependencies=[Depends(verify_api_key)])
 app.include_router(hotels.router, dependencies=[Depends(verify_api_key)])
 app.include_router(rooms.router, dependencies=[Depends(verify_api_key)])
 app.include_router(places.router, dependencies=[Depends(verify_api_key)])
 app.include_router(activities.router, dependencies=[Depends(verify_api_key)])
-app.include_router(combo.router, dependencies=[Depends(verify_api_key)])
 
 if __name__ == "__main__":
     import uvicorn
