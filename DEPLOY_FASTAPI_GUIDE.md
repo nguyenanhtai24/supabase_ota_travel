@@ -48,7 +48,7 @@ copy .env.example .env
 
 ### 2.2 Cài thư viện
 ```bash
-pip install -r requirements.txt
+pip install -r app/requirements.txt
 ```
 
 ### 2.3 Chạy import
@@ -77,8 +77,8 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 5000 --reload
 |--------|---------|
 | **Runtime** | Python 3 |
 | **Build Command** | `pip install -r requirements.txt` |
-| **Start Command** | `python -m uvicorn app.main:app --host 0.0.0.0 --port $PORT` |
-| **Root Directory** | *(để trống)* |
+| **Start Command** | `python -m uvicorn main:app --host 0.0.0.0 --port $PORT` |
+| **Root Directory** | `app` |
 
 ### 3.2 Thiết lập Environment Variables
 Vào tab **Environment** → thêm 2 biến:

@@ -187,7 +187,7 @@ def run_import():
                         act_description = act.get("description")
                         act_review_score = float(act["review_score"]) if act.get("review_score") is not None else None
 
-                        price_amount = 0.00;
+                        price_amount = 0.00
                         price_obj = act.get("price")
                         if price_obj:
                             if isinstance(price_obj.get("currency"), (int, float)):
