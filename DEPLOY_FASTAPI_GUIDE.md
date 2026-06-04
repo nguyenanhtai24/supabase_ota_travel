@@ -1,86 +1,161 @@
-# Hướng Dẫn Triển Khai Backend FastAPI & Database Supabase
+# Hướng dẫn Deploy — OTA Travel FastAPI Backend
 
-Tài liệu này hướng dẫn bạn từng bước thiết lập cơ sở dữ liệu trên **Supabase**, chạy script import dữ liệu, và deploy mã nguồn **FastAPI** (Python) lên **Render** chạy trực tuyến công khai.
+## Tổng quan
 
----
-
-## BƯỚC 1: Cấu hình Cơ sở dữ liệu trên Supabase
-
-1. **Khởi tạo các bảng dữ liệu (Table Schema):**
-   - Truy cập vào **SQL Editor** trên [Supabase Dashboard](https://supabase.com/dashboard) dự án của bạn.
-   - Nhấp **New query** để tạo trang soạn thảo SQL mới.
-   - Mở file [schema.sql](file:///d:/supabase_ota_travel/schema.sql), copy toàn bộ nội dung và dán vào SQL Editor của Supabase.
-   - Nhấn nút **Run**. Đảm bảo các bảng (`hotels`, `rooms`, `nearby_places`, `activities`) và các index được tạo thành công.
+| Mục | Công nghệ |
+|-----|-----------|
+| Backend | FastAPI (Python 3.11+) |
+| Database | PostgreSQL trên Supabase |
+| Hosting | Render (Web Service) |
+| Xác thực | API Key (header `X-API-Key`) |
 
 ---
 
-## BƯỚC 2: Cài đặt và Import dữ liệu ở Local
+## Bước 1 — Chuẩn bị Supabase
 
-1. **Cài đặt thư viện (nếu chưa thực hiện):**
-   - Đảm bảo bạn đang ở môi trường Miniconda. Mở terminal tại thư mục dự án và chạy:
-     ```powershell
-     pip install -r requirements.txt
-     ```
+### 1.1 Tạo Project
+1. Đăng ký / đăng nhập tại [supabase.com](https://supabase.com)
+2. Nhấn **New Project** → đặt tên, chọn region gần nhất (Singapore)
+3. Lưu lại **Database Password** (chỉ hiển thị một lần)
 
-2. **Chạy script tải dữ liệu lên Supabase:**
-   - Tôi đã tự động cấu hình chuỗi kết nối thực tế của dự án của bạn vào file `.env`. Bạn chỉ cần khởi chạy lệnh sau để import:
-     ```powershell
-     python import_data.py
-     ```
-   - Script sẽ đọc lần lượt 26 file JSON trong thư mục `processed/` và đẩy trực tiếp lên cơ sở dữ liệu Supabase của bạn.
-   - Đợi script hiển thị thông báo:
-     `Quá trình import dữ liệu hoàn tất thành công!`
+### 1.2 Tạo Schema (Tables)
+1. Vào **SQL Editor** trong Supabase Dashboard
+2. Copy toàn bộ nội dung file `schema.sql` → dán vào SQL Editor → nhấn **Run**
+3. Kiểm tra: 4 bảng `hotels`, `rooms`, `nearby_places`, `activities` được tạo thành công
 
----
-
-## BƯỚC 3: Chạy thử nghiệm cục bộ (Local Testing)
-
-1. **Khởi động server FastAPI bằng Uvicorn:**
-   - Trong terminal, chạy lệnh:
-     ```powershell
-     uvicorn main:app --reload --port 5000
-     ```
-   - Server sẽ chạy tại địa chỉ: `http://localhost:5000`.
-
-2. **Kiểm tra API tự động bằng Swagger UI:**
-   - FastAPI tự động tạo tài liệu và giao diện test API tại: `http://localhost:5000/docs`.
-   - Bạn có thể truy cập đường dẫn này trên trình duyệt và trực tiếp nhấn **Try it out** để test toàn bộ 15 API.
+### 1.3 Lấy Connection String
+1. Vào **Settings → Database → Connection string**
+2. Chọn tab **URI**
+3. Copy chuỗi có dạng:
+   ```
+   postgresql://postgres:[YOUR_PASSWORD]@db.[PROJECT_ID].supabase.co:5432/postgres
+   ```
+4. Thay `[YOUR_PASSWORD]` bằng password đã lưu ở bước 1.1
 
 ---
 
-## BƯỚC 4: Deploy lên Render
+## Bước 2 — Import dữ liệu
 
-Để deploy lên Render, dự án của bạn cần được đẩy lên GitHub.
+### 2.1 Thiết lập môi trường local
+```bash
+# Tạo file .env từ mẫu
+copy .env.example .env
 
-1. **Push code lên GitHub:**
-   - Commit các file mới tạo (FastAPI và Python files):
-     ```powershell
-     git add .
-     git commit -m "feat: migrate backend to Python FastAPI"
-     git push origin main
-     ```
+# Điền DATABASE_URL và API_SECRET_KEY vào .env
+# DATABASE_URL=postgresql://postgres:...
+# API_SECRET_KEY=your-secret-token-here
+```
 
-2. **Tạo Web Service trên Render:**
-   - Truy cập [Render Dashboard](https://dashboard.render.com).
-   - Chọn **New +** -> **Web Service**.
-   - Liên kết với GitHub và chọn kho lưu trữ dự án này.
+### 2.2 Cài thư viện
+```bash
+pip install -r requirements.txt
+```
 
-3. **Cấu hình Web Service:**
-   - **Name:** Đặt tên cho backend (ví dụ: `supabase-ota-travel-fastapi`).
-   - **Region:** Chọn khu vực gần Việt Nam (ví dụ: *Singapore*).
-   - **Runtime:** `Python`
-   - **Build Command:** `pip install -r requirements.txt`
-   - **Start Command:** `uvicorn main:app --host 0.0.0.0 --port $PORT`
-   - **Instance Type:** Chọn gói **Free** (Miễn phí).
+### 2.3 Chạy import
+```bash
+python import_data.py
+```
 
-4. **Thiết lập Biến môi trường trên Render:**
-   - Nhấp vào tab **Environment** trong cấu hình Render.
-   - Thêm biến sau:
-     * **Key:** `DATABASE_URL`
-     * **Value:** Dán chuỗi kết nối thực tế trong file `.env` của bạn:
-       `postgresql://postgres:o0PVbJXG1vzp8Z5T@db.icpmdjghxsstmlzxoefv.supabase.co:5432/postgres`
-   - Nhấn **Save changes** để Render tiến hành build và deploy.
+Script sẽ đọc 26 file JSON trong thư mục `processed/` và import vào Supabase.
+Sau khi chạy xong, kiểm tra dữ liệu trên Supabase → **Table Editor**.
 
-5. **Nghiệm thu trực tuyến:**
-   - Khi trạng thái chuyển sang **"Live"**, bạn sẽ có đường dẫn công khai (ví dụ: `https://supabase-ota-travel-fastapi.onrender.com`).
-   - Tài liệu Swagger UI trực tuyến cũng sẽ khả dụng tại: `https://[your-app].onrender.com/docs`.
+---
+
+## Bước 3 — Deploy lên Render
+
+### 3.1 Tạo Web Service
+1. Đăng nhập [render.com](https://render.com) → **New → Web Service**
+2. Kết nối GitHub repo `supabase_ota_travel`
+3. Cấu hình:
+
+| Trường | Giá trị |
+|--------|---------|
+| **Runtime** | Python 3 |
+| **Build Command** | `pip install -r requirements.txt` |
+| **Start Command** | `python -m uvicorn main:app --host 0.0.0.0 --port $PORT` |
+| **Root Directory** | *(để trống)* |
+
+### 3.2 Thiết lập Environment Variables
+Vào tab **Environment** → thêm 2 biến:
+
+| Key | Value |
+|-----|-------|
+| `DATABASE_URL` | Connection string từ Supabase (bước 1.3) |
+| `API_SECRET_KEY` | Token bí mật của bạn (tự đặt, ví dụ: `ota_sk_abc123xyz`) |
+
+### 3.3 Deploy
+- Nhấn **Deploy** → chờ build xong (~2–3 phút)
+- Log thành công sẽ hiển thị:
+  ```
+  INFO:     Uvicorn running on http://0.0.0.0:XXXX
+  Database Connection Pool đã được khởi tạo thành công!
+  ```
+
+---
+
+## Bước 4 — Kiểm tra API
+
+### 4.1 Health Check (không cần token)
+```bash
+curl https://your-app.onrender.com/health
+```
+Kết quả mong đợi:
+```json
+{"status": "OK", "version": "2.0.0", "message": "..."}
+```
+
+### 4.2 Gọi API với token
+```bash
+# Tìm khách sạn tại Đà Nẵng
+curl -H "X-API-Key: your-secret-token" \
+     "https://your-app.onrender.com/api/hotels?city=Đà Nẵng"
+
+# Lọc theo địa danh lân cận + khoảng cách
+curl -H "X-API-Key: your-secret-token" \
+     "https://your-app.onrender.com/api/hotels?city=Đà Nẵng&nearby_place_name=Sân bay Đà Nẵng&distance_max_km=5&sort_by=distance:asc"
+
+# Chi tiết khách sạn
+curl -H "X-API-Key: your-secret-token" \
+     "https://your-app.onrender.com/api/hotels/1"
+
+# Danh sách phòng, sắp xếp theo giá tăng dần
+curl -H "X-API-Key: your-secret-token" \
+     "https://your-app.onrender.com/api/hotels/1/rooms?sort_by=price:asc"
+```
+
+### 4.3 Swagger UI (tương tác trực tiếp)
+Mở trình duyệt: `https://your-app.onrender.com/docs`
+
+Nhấn **Authorize** → nhập API Key → test tất cả 15 endpoints.
+
+---
+
+## Danh sách 15 Endpoints
+
+| # | Endpoint | Mô tả |
+|---|----------|-------|
+| 1 | `GET /api/hotels` | Tìm kiếm & lọc danh sách khách sạn |
+| 2 | `GET /api/hotels/{id}` | Chi tiết đầy đủ một khách sạn |
+| 3 | `GET /api/hotels/{id}/images` | Toàn bộ ảnh khách sạn |
+| 4 | `GET /api/hotels/{id}/policies` | Chính sách nhận/trả phòng |
+| 5 | `GET /api/hotels/{id}/reviews` | Điểm đánh giá chi tiết |
+| 6 | `GET /api/hotels/{id}/location` | Tọa độ & địa điểm lân cận |
+| 7 | `GET /api/hotels/{id}/rooms` | Danh sách loại phòng |
+| 8 | `GET /api/rooms/{id}` | Chi tiết một loại phòng |
+| 9 | `GET /api/hotels/{id}/nearby-places` | Địa điểm nổi bật gần khách sạn |
+| 10 | `GET /api/hotels/{id}/activities` | Hoạt động vui chơi của khách sạn |
+| 11 | `GET /api/activities` | Tìm hoạt động toàn hệ thống |
+| 12 | `GET /api/hotels/{id}/combo` | Gợi ý gói combo |
+| 13 | `GET /api/hotels/combo-suggest` | Gợi ý combo theo ngân sách |
+| 14 | `GET /api/hotels/compare` | So sánh nhiều khách sạn |
+| 15 | `GET /api/hotels/{id}/similar` | Khách sạn tương tự rẻ hơn |
+
+---
+
+## Lưu ý quan trọng
+
+> **Bảo mật:** Không bao giờ commit file `.env` lên Git. File này đã được thêm vào `.gitignore`.
+
+> **API Key:** Nếu `API_SECRET_KEY` chưa được cấu hình trên server, API sẽ cho phép tất cả request (dev mode). Luôn đặt key trên Render trước khi ra production.
+
+> **Render Free Tier:** Server sẽ sleep sau 15 phút không có request. Request đầu tiên sau khi sleep sẽ mất ~30 giây để khởi động lại (cold start).

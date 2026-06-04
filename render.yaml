@@ -6,4 +6,6 @@ services:
     startCommand: python -m uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: DATABASE_URL
-        sync: false # Giá trị thực tế bạn điền thủ công trên Render Dashboard
+        sync: false  # Điền thủ công trên Render Dashboard
+      - key: API_SECRET_KEY
+        sync: false  # Điền thủ công trên Render Dashboard — token xác thực API
