@@ -97,6 +97,7 @@ def get_hotels(
 
         # Sắp xếp
         order_sql = "ORDER BY hotels.id ASC"
+        sort_params = []
         if sort_by == "review_score:desc":
             order_sql = "ORDER BY hotels.review_score DESC NULLS LAST"
         elif sort_by == "price:asc":
@@ -104,7 +105,7 @@ def get_hotels(
         elif sort_by == "price:desc":
             order_sql = "ORDER BY (SELECT MIN(price) FROM rooms WHERE rooms.hotel_id = hotels.id) DESC NULLS LAST"
         elif sort_by == "distance:asc" and nearby_place_name:
-            params.append(f"%{nearby_place_name}%")
+            sort_params.append(f"%{nearby_place_name}%")
             order_sql = """ORDER BY (
                 SELECT MIN(np_ord.distance_km) FROM nearby_places np_ord
                 WHERE np_ord.hotel_id = hotels.id
@@ -120,7 +121,7 @@ def get_hotels(
 
                 # Lấy dữ liệu phân trang
                 offset = (page - 1) * limit
-                page_params = list(params) + [limit, offset]
+                page_params = list(params) + sort_params + [limit, offset]
                 data_sql = f"""
                     SELECT
                         hotels.id,

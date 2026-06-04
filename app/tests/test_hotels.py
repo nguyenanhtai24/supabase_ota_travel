@@ -80,3 +80,44 @@ def test_get_hotel_by_id_not_found(client, mock_db):
     response = client.get("/api/hotels/999", headers={"X-API-Key": "ota_sk_test_token"})
     assert response.status_code == 404
     assert response.json()["detail"] == "Không tìm thấy khách sạn."
+
+def test_get_hotels_sorting_by_distance(client, mock_db):
+    """Test 6: GET /api/hotels with distance sort and nearby place filter succeeds."""
+    cursor = mock_db["cursor"]
+    cursor.fetchone.return_value = {"count": 1}
+    cursor.fetchall.side_effect = [
+        [{
+            "id": 1,
+            "name": "Hotel Test",
+            "accommodation_type": "Hotel",
+            "star_rating": 4.0,
+            "is_luxury": False,
+            "review_score": 8.5,
+            "review_count": 100,
+            "address": "123 Street",
+            "city": "Da Nang",
+            "latitude": 16.0,
+            "longitude": 108.0,
+            "description": "A nice test hotel",
+            "amenities": ["Wifi"],
+            "suitable_for": ["Family"],
+            "policynotes": ["No pets"],
+            "useful_info": {},
+            "images": ["http://image.url"],
+            "min_price": 500000.0
+        }],
+        [{
+            "hotel_id": 1,
+            "name": "Airport",
+            "type": "Transit",
+            "distance_km": 2.0
+        }]
+    ]
+    
+    response = client.get(
+        "/api/hotels?city=Da%20Nang&nearby_place_name=Airport&distance_max_km=5.0&sort_by=distance:asc",
+        headers={"X-API-Key": "ota_sk_test_token"}
+    )
+    assert response.status_code == 200
+    assert cursor.execute.called
+
