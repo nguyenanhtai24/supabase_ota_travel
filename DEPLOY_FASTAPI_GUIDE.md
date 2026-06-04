@@ -59,6 +59,11 @@ python import_data.py
 Script sẽ đọc 26 file JSON trong thư mục `processed/` và import vào Supabase.
 Sau khi chạy xong, kiểm tra dữ liệu trên Supabase → **Table Editor**.
 
+### 2.4 Chạy Server Local
+```bash
+python -m uvicorn app.main:app --host 127.0.0.1 --port 5000 --reload
+```
+
 ---
 
 ## Bước 3 — Deploy lên Render
@@ -72,7 +77,7 @@ Sau khi chạy xong, kiểm tra dữ liệu trên Supabase → **Table Editor**.
 |--------|---------|
 | **Runtime** | Python 3 |
 | **Build Command** | `pip install -r requirements.txt` |
-| **Start Command** | `python -m uvicorn main:app --host 0.0.0.0 --port $PORT` |
+| **Start Command** | `python -m uvicorn app.main:app --host 0.0.0.0 --port $PORT` |
 | **Root Directory** | *(để trống)* |
 
 ### 3.2 Thiết lập Environment Variables

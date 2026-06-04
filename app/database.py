@@ -1,12 +1,6 @@
-import os
 from contextlib import contextmanager
 from psycopg2.pool import ThreadedConnectionPool
-from dotenv import load_dotenv
-
-# Đọc các biến môi trường từ file .env
-load_dotenv()
-
-DATABASE_URL = os.getenv("DATABASE_URL")
+from app.config import DATABASE_URL
 
 if not DATABASE_URL or "YOUR_PASSWORD_HERE" in DATABASE_URL:
     raise ValueError("Lỗi: DATABASE_URL chưa được cấu hình đúng trong file .env")
