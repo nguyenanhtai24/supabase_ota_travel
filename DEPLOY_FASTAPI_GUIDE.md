@@ -76,9 +76,9 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 5000 --reload
 | Trường | Giá trị |
 |--------|---------|
 | **Runtime** | Python 3 |
-| **Build Command** | `pip install -r requirements.txt` |
-| **Start Command** | `python -m uvicorn main:app --host 0.0.0.0 --port $PORT` |
-| **Root Directory** | `app` |
+| **Build Command** | `pip install -r app/requirements.txt` |
+| **Start Command** | `python -m uvicorn app.main:app --host 0.0.0.0 --port $PORT` |
+| **Root Directory** | *(để trống)* |
 
 ### 3.2 Thiết lập Environment Variables
 Vào tab **Environment** → thêm 2 biến:
