@@ -19,6 +19,19 @@ def clean_row(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         return None
     return {k: serialize_value(v) for k, v in row.items()}
 
+def clean_param(val: Optional[str]) -> Optional[str]:
+    """Loại bỏ backticks (`) hoặc dấu nháy đơn/kép bao quanh giá trị tham số."""
+    if not val:
+        return val
+    val = val.strip()
+    while val and (val[0] in ('`', "'", '"') or val[-1] in ('`', "'", '"')):
+        if val[0] in ('`', "'", '"'):
+            val = val[1:]
+        if val and val[-1] in ('`', "'", '"'):
+            val = val[:-1]
+        val = val.strip()
+    return val
+
 def calculate_reviews_dashboard(reviews_array: Optional[Any]) -> Dict[str, Any]:
     """Tính điểm trung bình theo từng tiêu chí và trích xuất tags từ reviews_detail."""
     grades_default = {

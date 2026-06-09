@@ -1,502 +1,725 @@
-from typing import Optional, List, Dict, Any
-from fastapi import APIRouter, HTTPException, Query
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 from psycopg2.extras import RealDictCursor
+
 from app.database import get_db_connection
-from app.helpers import clean_row, calculate_reviews_dashboard
+from app.helpers import clean_param, clean_row
+from app.routers.common import csv_values, paginated_response, pagination_params, require_hotel_exists
 
 router = APIRouter()
 
-# 1. GET /api/hotels — Tìm kiếm & lọc danh sách khách sạn
+
+HOTEL_LIST_SELECT = """
+    SELECT
+        h.id,
+        h.name,
+        h.property_type,
+        h.accommodation_type,
+        h.star_rating,
+        h.is_luxury,
+        h.review_score,
+        h.review_count,
+        h.address,
+        h.city,
+        h.city_id,
+        h.area,
+        h.country,
+        h.latitude,
+        h.longitude,
+        h.description,
+        h.source_url,
+        (SELECT MIN(r.price) FROM rooms r WHERE r.hotel_id = h.id) AS min_room_price,
+        (SELECT hi.url FROM hotel_images hi WHERE hi.hotel_id = h.id ORDER BY hi.is_primary DESC, hi.id ASC LIMIT 1) AS primary_image,
+        COALESCE((
+            SELECT json_agg(json_build_object('id', a.id, 'name', a.name, 'category', a.category, 'category_id', a.category_id) ORDER BY a.name)
+            FROM hotel_amenities ha
+            JOIN amenities a ON a.id = ha.amenity_id
+            WHERE ha.hotel_id = h.id
+        ), '[]'::json) AS amenities,
+        COALESCE((
+            SELECT json_agg(json_build_object('id', hs.id, 'tag', hs.suitable_for_tag, 'mention_count', hs.mention_count, 'score', hs.score) ORDER BY hs.score DESC NULLS LAST, hs.suitable_for_tag)
+            FROM hotel_suitability hs
+            WHERE hs.hotel_id = h.id
+        ), '[]'::json) AS suitability
+"""
+
+
+def _hotel_filters(
+    city: Optional[str],
+    area: Optional[str],
+    country: Optional[str],
+    property_type: Optional[str],
+    accommodation_type: Optional[str],
+    star_rating_min: Optional[float],
+    star_rating_max: Optional[float],
+    review_score_min: Optional[float],
+    is_luxury: Optional[bool],
+    price_min: Optional[float],
+    price_max: Optional[float],
+    amenities: Optional[str],
+    suitable_for: Optional[str],
+    nearby_place_name: Optional[str],
+    distance_max_km: Optional[float],
+) -> tuple[List[str], List[Any]]:
+    clauses: List[str] = []
+    params: List[Any] = []
+
+    text_filters = [
+        ("h.city ILIKE %s", city),
+        ("h.area ILIKE %s", area),
+        ("h.country ILIKE %s", country),
+        ("h.property_type ILIKE %s", property_type),
+        ("h.accommodation_type ILIKE %s", accommodation_type),
+    ]
+    for clause, value in text_filters:
+        cleaned = clean_param(value)
+        if cleaned:
+            clauses.append(clause)
+            params.append(f"%{cleaned}%")
+
+    if star_rating_min is not None:
+        clauses.append("h.star_rating >= %s")
+        params.append(star_rating_min)
+    if star_rating_max is not None:
+        clauses.append("h.star_rating <= %s")
+        params.append(star_rating_max)
+    if review_score_min is not None:
+        clauses.append("h.review_score >= %s")
+        params.append(review_score_min)
+    if is_luxury is not None:
+        clauses.append("h.is_luxury = %s")
+        params.append(is_luxury)
+
+    if price_min is not None or price_max is not None:
+        room_clauses = ["r_price.hotel_id = h.id"]
+        if price_min is not None:
+            room_clauses.append("r_price.price >= %s")
+            params.append(price_min)
+        if price_max is not None:
+            room_clauses.append("r_price.price <= %s")
+            params.append(price_max)
+        clauses.append(f"EXISTS (SELECT 1 FROM rooms r_price WHERE {' AND '.join(room_clauses)})")
+
+    amenity_values = csv_values(amenities)
+    if amenity_values:
+        clauses.append("""
+            h.id IN (
+                SELECT ha.hotel_id
+                FROM hotel_amenities ha
+                JOIN amenities a ON a.id = ha.amenity_id
+                WHERE a.name = ANY(%s::text[])
+                GROUP BY ha.hotel_id
+                HAVING COUNT(DISTINCT a.name) = %s
+            )
+        """)
+        params.extend([amenity_values, len(amenity_values)])
+
+    suitable_values = csv_values(suitable_for)
+    if suitable_values:
+        clauses.append("""
+            h.id IN (
+                SELECT hs.hotel_id
+                FROM hotel_suitability hs
+                WHERE hs.suitable_for_tag = ANY(%s::text[])
+                GROUP BY hs.hotel_id
+                HAVING COUNT(DISTINCT hs.suitable_for_tag) = %s
+            )
+        """)
+        params.extend([suitable_values, len(suitable_values)])
+
+    nearby = clean_param(nearby_place_name)
+    if nearby:
+        nearby_clauses = ["np_filter.hotel_id = h.id", "np_filter.name ILIKE %s"]
+        params.append(f"%{nearby}%")
+        if distance_max_km is not None:
+            nearby_clauses.append("np_filter.distance_km <= %s")
+            params.append(distance_max_km)
+        clauses.append(f"EXISTS (SELECT 1 FROM nearby_places np_filter WHERE {' AND '.join(nearby_clauses)})")
+
+    return clauses, params
+
+
 @router.get("/api/hotels", tags=["Hotels"])
-def get_hotels(
-    city: Optional[str] = None,
-    accommodation_type: Optional[str] = None,
-    price_min: Optional[float] = None,
-    price_max: Optional[float] = None,
-    review_score_min: Optional[float] = None,
-    star_rating: Optional[float] = None,
+def list_hotels(
+    city: Optional[str] = Query(None, description="Lọc theo thành phố."),
+    area: Optional[str] = Query(None, description="Lọc theo khu vực."),
+    country: Optional[str] = Query(None, description="Lọc theo quốc gia."),
+    property_type: Optional[str] = Query(None, description="Lọc theo loại property."),
+    accommodation_type: Optional[str] = Query(None, description="Lọc theo loại lưu trú."),
+    star_rating_min: Optional[float] = Query(None, ge=0, le=5),
+    star_rating_max: Optional[float] = Query(None, ge=0, le=5),
+    review_score_min: Optional[float] = Query(None, ge=0, le=10),
     is_luxury: Optional[bool] = None,
-    amenities: Optional[str] = Query(None, description="Comma-separated, e.g. 'Hồ bơi,Spa'"),
-    suitable_for: Optional[str] = Query(None, description="Comma-separated, e.g. 'Cặp đôi'"),
-    nearby_place_name: Optional[str] = None,
-    distance_max_km: Optional[float] = None,
-    sort_by: Optional[str] = Query(None, description="review_score:desc | price:asc | price:desc | distance:asc"),
-    page: int = 1,
-    limit: int = 20
+    price_min: Optional[float] = Query(None, ge=0),
+    price_max: Optional[float] = Query(None, ge=0),
+    amenities: Optional[str] = Query(None, description="Danh sách tiện ích cách nhau bằng dấu phẩy."),
+    suitable_for: Optional[str] = Query(None, description="Danh sách tag phù hợp cách nhau bằng dấu phẩy."),
+    nearby_place_name: Optional[str] = Query(None, description="Tên địa điểm lân cận."),
+    distance_max_km: Optional[float] = Query(None, ge=0),
+    sort_by: Optional[str] = Query(None, description="id:asc | review_score:desc | star_rating:desc | price:asc | price:desc | distance:asc"),
+    page_limit: tuple[int, int, int] = Depends(pagination_params),
 ):
-    """
-    Tìm kiếm & lọc danh sách khách sạn. Hỗ trợ:
-    - Lọc theo thành phố, loại, sao, điểm, giá, tiện ích, đối tượng, địa danh lân cận
-    - Khi dùng `nearby_place_name`, mỗi hotel trả kèm `nearby_places` khoảng cách
-    - Sắp xếp theo `review_score:desc`, `price:asc/desc`, `distance:asc`
-    """
+    """Tìm kiếm danh sách khách sạn, trả toàn bộ trường cốt lõi của bảng `hotels` kèm dữ liệu tóm tắt liên quan."""
     try:
-        where_clauses = []
-        params = []
+        page, limit, offset = page_limit
+        sort_by = clean_param(sort_by) or "id:asc"
+        clauses, params = _hotel_filters(
+            city, area, country, property_type, accommodation_type, star_rating_min, star_rating_max,
+            review_score_min, is_luxury, price_min, price_max, amenities, suitable_for,
+            nearby_place_name, distance_max_km,
+        )
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
 
-        if city:
-            params.append(city)
-            where_clauses.append("hotels.city ILIKE %s")
-
-        if accommodation_type:
-            params.append(accommodation_type)
-            where_clauses.append("hotels.accommodation_type = %s")
-
-        if review_score_min is not None:
-            params.append(review_score_min)
-            where_clauses.append("hotels.review_score >= %s")
-
-        if star_rating is not None:
-            params.append(star_rating)
-            where_clauses.append("hotels.star_rating = %s")
-
-        if is_luxury is not None:
-            params.append(is_luxury)
-            where_clauses.append("hotels.is_luxury = %s")
-
-        if amenities:
-            amenities_list = [a.strip() for a in amenities.split(",") if a.strip()]
-            params.append(amenities_list)
-            where_clauses.append("hotels.amenities @> %s::text[]")
-
-        if suitable_for:
-            suitable_list = [s.strip() for s in suitable_for.split(",") if s.strip()]
-            params.append(suitable_list)
-            where_clauses.append("hotels.suitable_for @> %s::text[]")
-
-        # Lọc theo địa danh lân cận + khoảng cách tối đa
-        if nearby_place_name:
-            params.append(f"%{nearby_place_name}%")
-            dist_clause = ""
-            if distance_max_km is not None:
-                params.append(distance_max_km)
-                dist_clause = "AND np_filter.distance_km <= %s"
-            where_clauses.append(f"""EXISTS (
-                SELECT 1 FROM nearby_places np_filter
-                WHERE np_filter.hotel_id = hotels.id
-                AND np_filter.name ILIKE %s
-                {dist_clause}
-            )""")
-
-        # Lọc theo giá phòng
-        if price_min is not None or price_max is not None:
-            price_conds = []
-            if price_min is not None:
-                params.append(price_min)
-                price_conds.append("r_price.price >= %s")
-            if price_max is not None:
-                params.append(price_max)
-                price_conds.append("r_price.price <= %s")
-            where_clauses.append(f"""EXISTS (
-                SELECT 1 FROM rooms r_price
-                WHERE r_price.hotel_id = hotels.id
-                AND {" AND ".join(price_conds)}
-            )""")
-
-        where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
-
-        # Sắp xếp
-        order_sql = "ORDER BY hotels.id ASC"
-        sort_params = []
+        order_sql = "ORDER BY h.id ASC"
+        order_params: List[Any] = []
         if sort_by == "review_score:desc":
-            order_sql = "ORDER BY hotels.review_score DESC NULLS LAST"
+            order_sql = "ORDER BY h.review_score DESC NULLS LAST, h.id ASC"
+        elif sort_by == "star_rating:desc":
+            order_sql = "ORDER BY h.star_rating DESC NULLS LAST, h.review_score DESC NULLS LAST"
         elif sort_by == "price:asc":
-            order_sql = "ORDER BY (SELECT MIN(price) FROM rooms WHERE rooms.hotel_id = hotels.id) ASC NULLS LAST"
+            order_sql = "ORDER BY (SELECT MIN(r.price) FROM rooms r WHERE r.hotel_id = h.id) ASC NULLS LAST"
         elif sort_by == "price:desc":
-            order_sql = "ORDER BY (SELECT MIN(price) FROM rooms WHERE rooms.hotel_id = hotels.id) DESC NULLS LAST"
-        elif sort_by == "distance:asc" and nearby_place_name:
-            sort_params.append(f"%{nearby_place_name}%")
-            order_sql = """ORDER BY (
-                SELECT MIN(np_ord.distance_km) FROM nearby_places np_ord
-                WHERE np_ord.hotel_id = hotels.id
-                AND np_ord.name ILIKE %s
-            ) ASC NULLS LAST"""
+            order_sql = "ORDER BY (SELECT MIN(r.price) FROM rooms r WHERE r.hotel_id = h.id) DESC NULLS LAST"
+        elif sort_by == "distance:asc" and clean_param(nearby_place_name):
+            order_sql = """
+                ORDER BY (
+                    SELECT MIN(np_order.distance_km)
+                    FROM nearby_places np_order
+                    WHERE np_order.hotel_id = h.id AND np_order.name ILIKE %s
+                ) ASC NULLS LAST
+            """
+            order_params.append(f"%{clean_param(nearby_place_name)}%")
 
         with get_db_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                # Đếm tổng bản ghi khớp
-                count_sql = f"SELECT COUNT(*) FROM hotels {where_sql}"
-                cur.execute(count_sql, tuple(params))
+                cur.execute(f"SELECT COUNT(*) AS count FROM hotels h {where_sql}", tuple(params))
                 total = cur.fetchone()["count"]
+                cur.execute(
+                    f"{HOTEL_LIST_SELECT} FROM hotels h {where_sql} {order_sql} LIMIT %s OFFSET %s",
+                    tuple(params + order_params + [limit, offset]),
+                )
+                rows = [clean_row(row) for row in cur.fetchall()]
 
-                # Lấy dữ liệu phân trang
-                offset = (page - 1) * limit
-                page_params = list(params) + sort_params + [limit, offset]
-                data_sql = f"""
-                    SELECT
-                        hotels.id,
-                        hotels.name,
-                        hotels.accommodation_type,
-                        hotels.star_rating,
-                        hotels.is_luxury,
-                        hotels.review_score,
-                        hotels.review_count,
-                        hotels.address,
-                        hotels.city,
-                        hotels.latitude,
-                        hotels.longitude,
-                        hotels.amenities,
-                        hotels.suitable_for,
-                        hotels.policyNotes,
-                        hotels.useful_info,
-                        hotels.description,
-                        hotels.images,
-                        (SELECT MIN(price) FROM rooms WHERE rooms.hotel_id = hotels.id) AS min_price
-                    FROM hotels
-                    {where_sql}
-                    {order_sql}
-                    LIMIT %s OFFSET %s
-                """
-                cur.execute(data_sql, tuple(page_params))
-                rows = cur.fetchall()
-
-                # Nếu lọc nearby_place_name, lấy thêm nearby_places cho từng hotel
-                nearby_by_hotel: Dict[int, List[Dict]] = {}
-                if nearby_place_name and rows:
-                    hotel_ids = [r["id"] for r in rows]
-                    np_sql = """
-                        SELECT hotel_id, name, type, distance_km
-                        FROM nearby_places
-                        WHERE hotel_id = ANY(%s::int[])
-                        AND name ILIKE %s
-                        ORDER BY distance_km ASC
-                    """
-                    cur.execute(np_sql, (hotel_ids, f"%{nearby_place_name}%"))
-                    for np_row in cur.fetchall():
-                        hid = np_row["hotel_id"]
-                        if hid not in nearby_by_hotel:
-                            nearby_by_hotel[hid] = []
-                        nearby_by_hotel[hid].append({
-                            "name": np_row["name"],
-                            "type": np_row["type"],
-                            "distance_km": float(np_row["distance_km"]) if np_row["distance_km"] is not None else None
-                        })
-
-        # Xây dựng response
-        hotels_data = []
-        for row in rows:
-            cleaned = clean_row(row)
-            hotel_item = {
-                "id": cleaned["id"],
-                "name": cleaned["name"],
-                "accommodation_type": cleaned["accommodation_type"],
-                "star_rating": cleaned["star_rating"],
-                "is_luxury": cleaned["is_luxury"],
-                "review_score": cleaned["review_score"],
-                "review_count": cleaned["review_count"],
-                "address": cleaned["address"],
-                "city": cleaned["city"],
-                "latitude": cleaned["latitude"],
-                "longitude": cleaned["longitude"],
-                "description": (cleaned["description"] or "")[:200] if cleaned.get("description") else None,
-                "amenities": cleaned["amenities"] if cleaned["amenities"] else [],
-                "suitable_for": cleaned["suitable_for"] if cleaned["suitable_for"] else [],
-                "policyNotes": (cleaned.get("policynotes") or cleaned.get("policyNotes") or []),
-                "useful_info": cleaned["useful_info"],
-                "images": [row["images"][0]] if row["images"] else [],
-                "rooms": {
-                    "min_price": cleaned["min_price"]
-                }
-            }
-            # Chỉ thêm nearby_places nếu đang filter theo địa danh
-            if nearby_place_name:
-                hotel_item["nearby_places"] = nearby_by_hotel.get(row["id"], [])
-            hotels_data.append(hotel_item)
-
-        return {
-            "total": total,
-            "page": page,
-            "limit": limit,
-            "data": hotels_data
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return paginated_response(total, page, limit, rows)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
-# 14. GET /api/hotels/compare
 @router.get("/api/hotels/compare", tags=["Hotels"])
-def compare_hotels(
-    ids: str = Query(..., description="Comma-separated hotel IDs, e.g. '1,2,3'")
-):
-    """So sánh song song nhiều khách sạn theo tất cả tiêu chí."""
+def compare_hotels(ids: str = Query(..., description="Hotel IDs cách nhau bằng dấu phẩy, ví dụ: 1,2,3")):
+    """So sánh nhiều khách sạn với toàn bộ trường chính và dữ liệu liên quan quan trọng."""
+    id_values = [int(item) for item in csv_values(ids) if item.isdigit()]
+    if not id_values:
+        raise HTTPException(status_code=400, detail="ids phải chứa ít nhất một số nguyên.")
     try:
-        id_list = []
-        for i in ids.split(","):
-            try:
-                id_list.append(int(i.strip()))
-            except ValueError:
-                continue
-
-        if not id_list:
-            raise HTTPException(status_code=400, detail="ids phải là danh sách số nguyên cách nhau bằng dấu phẩy.")
-
-        sql = """
-            SELECT hotels.*,
-                (SELECT MIN(price) FROM rooms WHERE rooms.hotel_id = hotels.id) AS min_price
-            FROM hotels
-            WHERE id = ANY(%s::int[])
-        """
+        sql = f"{HOTEL_LIST_SELECT} FROM hotels h WHERE h.id = ANY(%s::int[]) ORDER BY array_position(%s::int[], h.id)"
         with get_db_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(sql, (id_list,))
-                rows = cur.fetchall()
-
-        hotels_data = []
-        for row in rows:
-            dashboard = calculate_reviews_dashboard(row["reviews_detail"])
-            hotels_data.append({
-                "id": row["id"],
-                "name": row["name"],
-                "star_rating": float(row["star_rating"]) if row["star_rating"] else None,
-                "is_luxury": row["is_luxury"],
-                "review_score": float(row["review_score"]) if row["review_score"] else None,
-                "review_count": row["review_count"],
-                "reviews_detail": {"grades": dashboard["grades"]},
-                "amenities": row["amenities"] or [],
-                "rooms": {"min_price": float(row["min_price"]) if row["min_price"] is not None else None},
-                "images": [row["images"][0]] if row["images"] else []
-            })
-
-        return {"hotels": hotels_data}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+                cur.execute(sql, (id_values, id_values))
+                rows = [clean_row(row) for row in cur.fetchall()]
+        return {"hotels": rows}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
-# 2. GET /api/hotels/{id} — Chi tiết đầy đủ một khách sạn
-@router.get("/api/hotels/{id}", tags=["Hotels"])
-def get_hotel(id: int):
-    """Lấy toàn bộ thông tin chi tiết một khách sạn."""
+@router.get("/api/hotels/{hotel_id}", tags=["Hotels"])
+def get_hotel_detail(hotel_id: int):
+    """Lấy chi tiết khách sạn, bao phủ toàn bộ bảng quan hệ gắn với `hotel_id`."""
     try:
         with get_db_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT * FROM hotels WHERE id = %s", (id,))
-                row = cur.fetchone()
-
-        if not row:
-            raise HTTPException(status_code=404, detail="Không tìm thấy khách sạn.")
-
-        cleaned = clean_row(row)
-        return {
-            "id": cleaned["id"],
-            "name": cleaned["name"],
-            "accommodation_type": cleaned["accommodation_type"],
-            "star_rating": cleaned["star_rating"],
-            "is_luxury": cleaned["is_luxury"],
-            "review_score": cleaned["review_score"],
-            "review_count": cleaned["review_count"],
-            "address": cleaned["address"],
-            "city": cleaned["city"],
-            "latitude": cleaned["latitude"],
-            "longitude": cleaned["longitude"],
-            "description": cleaned["description"],
-            "amenities": cleaned["amenities"] or [],
-            "suitable_for": cleaned["suitable_for"] or [],
-            "useful_info": cleaned["useful_info"],
-            "policyNotes": cleaned.get("policynotes") or cleaned.get("policyNotes") or [],
-            "images": cleaned["images"] or [],
-            "reviews_detail": cleaned["reviews_detail"],
-            "source_url": cleaned.get("source_url")
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# 3. GET /api/hotels/{id}/images — Ảnh khách sạn
-@router.get("/api/hotels/{id}/images", tags=["Hotels"])
-def get_hotel_images(id: int):
-    """Lấy toàn bộ URL ảnh của khách sạn."""
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT id, name, images FROM hotels WHERE id = %s", (id,))
-                row = cur.fetchone()
-
-        if not row:
-            raise HTTPException(status_code=404, detail="Không tìm thấy khách sạn.")
-
-        return {
-            "hotel_id": row["id"],
-            "hotel_name": row["name"],
-            "images": row["images"] or []
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# 4. GET /api/hotels/{id}/policies — Chính sách khách sạn
-@router.get("/api/hotels/{id}/policies", tags=["Hotels"])
-def get_hotel_policies(id: int):
-    """Lấy chính sách nhận/trả phòng, phụ phí và ghi chú đặc biệt."""
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT id, policyNotes, useful_info FROM hotels WHERE id = %s", (id,))
-                row = cur.fetchone()
-
-        if not row:
-            raise HTTPException(status_code=404, detail="Không tìm thấy khách sạn.")
-
-        return {
-            "hotel_id": row["id"],
-            "policyNotes": row.get("policynotes") or row.get("policyNotes") or [],
-            "useful_info": clean_row({"u": row["useful_info"]})["u"] or {}
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# 5. GET /api/hotels/{id}/reviews — Điểm đánh giá chi tiết
-@router.get("/api/hotels/{id}/reviews", tags=["Hotels"])
-def get_hotel_reviews(id: int):
-    """Lấy điểm đánh giá tổng quan và chi tiết theo từng tiêu chí (grades + tags)."""
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(
-                    "SELECT id, review_score, review_count, reviews_detail FROM hotels WHERE id = %s",
-                    (id,)
-                )
-                row = cur.fetchone()
-
-        if not row:
-            raise HTTPException(status_code=404, detail="Không tìm thấy khách sạn.")
-
-        dashboard = calculate_reviews_dashboard(row["reviews_detail"])
-        return {
-            "hotel_id": row["id"],
-            "review_score": float(row["review_score"]) if row["review_score"] else None,
-            "review_count": row["review_count"],
-            "reviews_detail": {
-                "grades": dashboard["grades"],
-                "tags": dashboard["tags"]
-            }
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# 6. GET /api/hotels/{id}/location — Tọa độ & địa điểm lân cận
-@router.get("/api/hotels/{id}/location", tags=["Hotels"])
-def get_hotel_location(id: int):
-    """Lấy tọa độ, địa chỉ và danh sách địa điểm lân cận kèm khoảng cách."""
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(
-                    "SELECT id, name, address, city, latitude, longitude FROM hotels WHERE id = %s",
-                    (id,)
-                )
+                cur.execute("SELECT * FROM hotels WHERE id = %s", (hotel_id,))
                 hotel = cur.fetchone()
                 if not hotel:
                     raise HTTPException(status_code=404, detail="Không tìm thấy khách sạn.")
 
-                cur.execute(
-                    "SELECT id, name, type, distance_km FROM nearby_places WHERE hotel_id = %s ORDER BY distance_km ASC",
-                    (id,)
-                )
-                places = cur.fetchall()
-
-        return {
-            "hotel_id": hotel["id"],
-            "name": hotel["name"],
-            "address": hotel["address"],
-            "city": hotel["city"],
-            "latitude": hotel["latitude"],
-            "longitude": hotel["longitude"],
-            "nearby_places": [clean_row(p) for p in places]
-        }
-
+                related_queries = {
+                    "images": "SELECT id, hotel_id, url, is_primary FROM hotel_images WHERE hotel_id = %s ORDER BY is_primary DESC, id ASC",
+                    "policy": "SELECT * FROM hotel_policies WHERE hotel_id = %s",
+                    "amenities": """
+                        SELECT a.id, a.name, a.category, a.category_id, ac.name AS category_name
+                        FROM hotel_amenities ha
+                        JOIN amenities a ON a.id = ha.amenity_id
+                        LEFT JOIN amenity_categories ac ON ac.id = a.category_id
+                        WHERE ha.hotel_id = %s
+                        ORDER BY ac.name NULLS LAST, a.name
+                    """,
+                    "suitability": "SELECT * FROM hotel_suitability WHERE hotel_id = %s ORDER BY score DESC NULLS LAST, suitable_for_tag",
+                    "review_grades": "SELECT * FROM review_grades WHERE hotel_id = %s ORDER BY grade_name",
+                    "review_aspects": "SELECT * FROM review_aspects WHERE hotel_id = %s ORDER BY mentioned DESC NULLS LAST, aspect_name",
+                    "reviews": "SELECT * FROM reviews WHERE hotel_id = %s ORDER BY review_date DESC NULLS LAST, id DESC",
+                    "rooms": "SELECT * FROM rooms WHERE hotel_id = %s ORDER BY price ASC NULLS LAST, id ASC",
+                    "nearby_places": """
+                        SELECT np.id, np.hotel_id, np.name, np.type, np.category_id, pc.name AS category_name, np.distance_km
+                        FROM nearby_places np
+                        LEFT JOIN place_categories pc ON pc.id = np.category_id
+                        WHERE np.hotel_id = %s
+                        ORDER BY np.distance_km ASC NULLS LAST, np.id ASC
+                    """,
+                    "activities": "SELECT * FROM activities WHERE hotel_id = %s ORDER BY review_score DESC NULLS LAST, id ASC",
+                }
+                detail: Dict[str, Any] = clean_row(hotel)
+                for key, query in related_queries.items():
+                    cur.execute(query, (hotel_id,))
+                    rows = cur.fetchall()
+                    if key == "policy":
+                        detail[key] = clean_row(rows[0]) if rows else None
+                    else:
+                        detail[key] = [clean_row(row) for row in rows]
+        return detail
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
-# 15. GET /api/hotels/{id}/similar — Khách sạn tương tự rẻ hơn
-@router.get("/api/hotels/{id}/similar", tags=["Hotels"])
-def get_similar_hotels(id: int):
-    """Gợi ý các khách sạn tương tự (cùng thành phố, cùng loại) nhưng rẻ hơn ít nhất 10%."""
+@router.get("/api/hotels/{hotel_id}/images", tags=["Hotel Images"])
+def get_hotel_images(hotel_id: int):
+    """Lấy toàn bộ trường của `hotel_images` theo khách sạn."""
+    require_hotel_exists(hotel_id)
+    rows = []
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT id, hotel_id, url, is_primary FROM hotel_images WHERE hotel_id = %s ORDER BY is_primary DESC, id ASC", (hotel_id,))
+                rows = [clean_row(row) for row in cur.fetchall()]
+        return {"hotel_id": hotel_id, "images": rows}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/api/hotels/{hotel_id}/policies", tags=["Hotel Policies"])
+def get_hotel_policies(hotel_id: int):
+    """Lấy toàn bộ trường của `hotel_policies`."""
+    require_hotel_exists(hotel_id)
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT * FROM hotel_policies WHERE hotel_id = %s", (hotel_id,))
+                row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Khách sạn này chưa có dữ liệu chính sách.")
+        return clean_row(row)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/api/hotels/{hotel_id}/reviews", tags=["Reviews"])
+def get_hotel_reviews(hotel_id: int, page_limit: tuple[int, int, int] = Depends(pagination_params)):
+    """Lấy reviews thô, review grades và review aspects của khách sạn."""
+    require_hotel_exists(hotel_id)
+    page, limit, offset = page_limit
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT COUNT(*) AS count FROM reviews WHERE hotel_id = %s", (hotel_id,))
+                total = cur.fetchone()["count"]
+                cur.execute("SELECT * FROM reviews WHERE hotel_id = %s ORDER BY review_date DESC NULLS LAST, id DESC LIMIT %s OFFSET %s", (hotel_id, limit, offset))
+                reviews = [clean_row(row) for row in cur.fetchall()]
+                cur.execute("SELECT * FROM review_grades WHERE hotel_id = %s ORDER BY grade_name", (hotel_id,))
+                grades = [clean_row(row) for row in cur.fetchall()]
+                cur.execute("SELECT * FROM review_aspects WHERE hotel_id = %s ORDER BY mentioned DESC NULLS LAST, aspect_name", (hotel_id,))
+                aspects = [clean_row(row) for row in cur.fetchall()]
+        response = paginated_response(total, page, limit, reviews)
+        response["grades"] = grades
+        response["aspects"] = aspects
+        return response
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/api/hotels/{hotel_id}/amenities", tags=["Amenities"])
+def get_hotel_amenities(hotel_id: int):
+    """Lấy tiện ích của khách sạn, bao gồm trường từ `amenities`, `amenity_categories` và quan hệ `hotel_amenities`."""
+    require_hotel_exists(hotel_id)
     try:
         with get_db_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
                     """
-                    SELECT hotels.*,
-                        COALESCE((SELECT MIN(price) FROM rooms WHERE rooms.hotel_id = hotels.id), 3000000) AS min_price
-                    FROM hotels WHERE id = %s
+                    SELECT ha.hotel_id, ha.amenity_id, a.name, a.category, a.category_id, ac.name AS category_name
+                    FROM hotel_amenities ha
+                    JOIN amenities a ON a.id = ha.amenity_id
+                    LEFT JOIN amenity_categories ac ON ac.id = a.category_id
+                    WHERE ha.hotel_id = %s
+                    ORDER BY ac.name NULLS LAST, a.name
                     """,
-                    (id,)
+                    (hotel_id,),
+                )
+                rows = [clean_row(row) for row in cur.fetchall()]
+        return {"hotel_id": hotel_id, "amenities": rows}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/api/hotels/{hotel_id}/suitability", tags=["Suitability"])
+def get_hotel_suitability(hotel_id: int):
+    """Lấy toàn bộ trường của `hotel_suitability`."""
+    require_hotel_exists(hotel_id)
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT * FROM hotel_suitability WHERE hotel_id = %s ORDER BY score DESC NULLS LAST, suitable_for_tag", (hotel_id,))
+                rows = [clean_row(row) for row in cur.fetchall()]
+        return {"hotel_id": hotel_id, "suitability": rows}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/api/hotels/{hotel_id}/location", tags=["Nearby Places"])
+def get_hotel_location(hotel_id: int):
+    """Lấy tọa độ khách sạn và các địa điểm lân cận."""
+    require_hotel_exists(hotel_id)
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT id, name, address, city, city_id, area, country, latitude, longitude FROM hotels WHERE id = %s", (hotel_id,))
+                hotel = clean_row(cur.fetchone())
+                cur.execute(
+                    """
+                    SELECT np.id, np.hotel_id, np.name, np.type, np.category_id, pc.name AS category_name, np.distance_km
+                    FROM nearby_places np
+                    LEFT JOIN place_categories pc ON pc.id = np.category_id
+                    WHERE np.hotel_id = %s
+                    ORDER BY np.distance_km ASC NULLS LAST
+                    """,
+                    (hotel_id,),
+                )
+                hotel["nearby_places"] = [clean_row(row) for row in cur.fetchall()]
+        return hotel
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/api/hotels/{hotel_id}/text-chunks", tags=["Text Chunks"])
+def get_hotel_text_chunks(hotel_id: int, include_embedding: bool = Query(False, description="Đặt true nếu cần trả embedding dạng text.")):
+    """Lấy `text_chunks` theo khách sạn. Bảng này có thể rỗng nếu chưa insert embeddings."""
+    require_hotel_exists(hotel_id)
+    embedding_select = "embedding::text AS embedding" if include_embedding else "NULL AS embedding"
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    f"SELECT id, hotel_id, chunk_type, content, {embedding_select}, metadata, created_at FROM text_chunks WHERE hotel_id = %s ORDER BY id ASC",
+                    (hotel_id,),
+                )
+                rows = [clean_row(row) for row in cur.fetchall()]
+        return {"hotel_id": hotel_id, "text_chunks": rows}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/api/hotels/{hotel_id}/similar", tags=["Hotels"])
+def get_similar_hotels(hotel_id: int, limit: int = Query(5, ge=1, le=20)):
+    """Gợi ý khách sạn tương tự theo thành phố, loại lưu trú và khoảng giá phòng tối thiểu."""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT h.*, (SELECT MIN(price) FROM rooms WHERE hotel_id = h.id) AS min_room_price
+                    FROM hotels h
+                    WHERE h.id = %s
+                    """,
+                    (hotel_id,),
                 )
                 ref = cur.fetchone()
                 if not ref:
-                    raise HTTPException(status_code=404, detail="Không tìm thấy khách sạn tham chiếu.")
-
-                ref_price = float(ref["min_price"])
-                price_threshold = ref_price * 0.9  # Rẻ hơn ít nhất 10%
-
+                    raise HTTPException(status_code=404, detail="Không tìm thấy khách sạn.")
+                ref_price = ref["min_room_price"]
                 cur.execute(
-                    """
-                    SELECT hotels.*,
-                        (SELECT MIN(price) FROM rooms WHERE rooms.hotel_id = hotels.id) AS min_price
-                    FROM hotels
-                    WHERE city = %s
-                      AND accommodation_type = %s
-                      AND id != %s
-                      AND EXISTS (
-                          SELECT 1 FROM rooms
-                          WHERE rooms.hotel_id = hotels.id
-                          AND price <= %s
+                    f"""
+                    {HOTEL_LIST_SELECT}
+                    FROM hotels h
+                    WHERE h.id <> %s
+                      AND h.city IS NOT DISTINCT FROM %s
+                      AND h.accommodation_type IS NOT DISTINCT FROM %s
+                      AND (
+                          %s::numeric IS NULL OR
+                          (SELECT MIN(price) FROM rooms WHERE hotel_id = h.id) BETWEEN %s::numeric * 0.75 AND %s::numeric * 1.25
                       )
-                    ORDER BY review_score DESC NULLS LAST
-                    LIMIT 3
+                    ORDER BY h.review_score DESC NULLS LAST, h.star_rating DESC NULLS LAST
+                    LIMIT %s
                     """,
-                    (ref["city"], ref["accommodation_type"], id, price_threshold)
+                    (hotel_id, ref["city"], ref["accommodation_type"], ref_price, ref_price, ref_price, limit),
                 )
-                similar = cur.fetchall()
-
-        formatted_similar = []
-        for s in similar:
-            s_price = float(s["min_price"]) if s["min_price"] else 0
-            saving_pct = int(round((1 - s_price / ref_price) * 100)) if ref_price > 0 else 0
-            formatted_similar.append({
-                "id": s["id"],
-                "name": s["name"],
-                "star_rating": float(s["star_rating"]) if s["star_rating"] else None,
-                "review_score": float(s["review_score"]) if s["review_score"] else None,
-                "amenities": (s["amenities"] or [])[:5],
-                "rooms": {"min_price": s_price},
-                "price_saving_pct": saving_pct,
-                "images": [s["images"][0]] if s["images"] else []
-            })
-
-        return {
-            "reference_hotel": {
-                "id": ref["id"],
-                "name": ref["name"],
-                "review_score": float(ref["review_score"]) if ref["review_score"] else None,
-                "amenities": (ref["amenities"] or [])[:5],
-                "rooms": {"min_price": ref_price}
-            },
-            "similar_hotels": formatted_similar
-        }
-
+                rows = [clean_row(row) for row in cur.fetchall()]
+        return {"reference_hotel": clean_row(ref), "similar_hotels": rows}
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/api/amenity-categories", tags=["Amenities"])
+def list_amenity_categories():
+    """Lấy toàn bộ trường của `amenity_categories`."""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT id, name FROM amenity_categories ORDER BY name")
+                rows = [clean_row(row) for row in cur.fetchall()]
+        return {"data": rows}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/api/amenities", tags=["Amenities"])
+def list_amenities(
+    category_id: Optional[int] = Query(None),
+    category: Optional[str] = Query(None),
+    name: Optional[str] = Query(None),
+    page_limit: tuple[int, int, int] = Depends(pagination_params),
+):
+    """Lấy danh mục tiện ích, bao phủ toàn bộ trường của `amenities` và tên category."""
+    page, limit, offset = page_limit
+    clauses = []
+    params = []
+    if category_id is not None:
+        clauses.append("a.category_id = %s")
+        params.append(category_id)
+    for clause, value in [("a.category ILIKE %s", category), ("a.name ILIKE %s", name)]:
+        cleaned = clean_param(value)
+        if cleaned:
+            clauses.append(clause)
+            params.append(f"%{cleaned}%")
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(f"SELECT COUNT(*) AS count FROM amenities a LEFT JOIN amenity_categories ac ON ac.id = a.category_id {where_sql}", tuple(params))
+                total = cur.fetchone()["count"]
+                cur.execute(
+                    f"""
+                    SELECT a.id, a.name, a.category, a.category_id, ac.name AS category_name
+                    FROM amenities a
+                    LEFT JOIN amenity_categories ac ON ac.id = a.category_id
+                    {where_sql}
+                    ORDER BY ac.name NULLS LAST, a.name
+                    LIMIT %s OFFSET %s
+                    """,
+                    tuple(params + [limit, offset]),
+                )
+                rows = [clean_row(row) for row in cur.fetchall()]
+        return paginated_response(total, page, limit, rows)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/api/hotel-suitability", tags=["Suitability"])
+def list_hotel_suitability(
+    hotel_id: Optional[int] = Query(None),
+    tag: Optional[str] = Query(None),
+    page_limit: tuple[int, int, int] = Depends(pagination_params),
+):
+    """Lấy toàn bộ trường của `hotel_suitability` trên toàn hệ thống."""
+    page, limit, offset = page_limit
+    clauses = []
+    params = []
+    if hotel_id is not None:
+        clauses.append("hs.hotel_id = %s")
+        params.append(hotel_id)
+    tag_value = clean_param(tag)
+    if tag_value:
+        clauses.append("hs.suitable_for_tag ILIKE %s")
+        params.append(f"%{tag_value}%")
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(f"SELECT COUNT(*) AS count FROM hotel_suitability hs {where_sql}", tuple(params))
+                total = cur.fetchone()["count"]
+                cur.execute(
+                    f"""
+                    SELECT hs.*, h.name AS hotel_name, h.city AS hotel_city
+                    FROM hotel_suitability hs
+                    JOIN hotels h ON h.id = hs.hotel_id
+                    {where_sql}
+                    ORDER BY hs.score DESC NULLS LAST, hs.suitable_for_tag
+                    LIMIT %s OFFSET %s
+                    """,
+                    tuple(params + [limit, offset]),
+                )
+                rows = [clean_row(row) for row in cur.fetchall()]
+        return paginated_response(total, page, limit, rows)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/api/reviews", tags=["Reviews"])
+def list_reviews(
+    hotel_id: Optional[int] = Query(None),
+    rating_min: Optional[float] = Query(None, ge=0, le=10),
+    reviewer_country: Optional[str] = Query(None),
+    page_limit: tuple[int, int, int] = Depends(pagination_params),
+):
+    """Lấy toàn bộ trường của `reviews` trên toàn hệ thống."""
+    page, limit, offset = page_limit
+    clauses = []
+    params = []
+    if hotel_id is not None:
+        clauses.append("r.hotel_id = %s")
+        params.append(hotel_id)
+    if rating_min is not None:
+        clauses.append("r.rating >= %s")
+        params.append(rating_min)
+    country = clean_param(reviewer_country)
+    if country:
+        clauses.append("r.reviewer_country ILIKE %s")
+        params.append(f"%{country}%")
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(f"SELECT COUNT(*) AS count FROM reviews r {where_sql}", tuple(params))
+                total = cur.fetchone()["count"]
+                cur.execute(
+                    f"""
+                    SELECT r.*, h.name AS hotel_name, h.city AS hotel_city
+                    FROM reviews r
+                    JOIN hotels h ON h.id = r.hotel_id
+                    {where_sql}
+                    ORDER BY r.review_date DESC NULLS LAST, r.id DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    tuple(params + [limit, offset]),
+                )
+                rows = [clean_row(row) for row in cur.fetchall()]
+        return paginated_response(total, page, limit, rows)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/api/reviews/{review_id}", tags=["Reviews"])
+def get_review(review_id: int):
+    """Lấy chi tiết một review theo `reviews.id`."""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT r.*, h.name AS hotel_name, h.city AS hotel_city
+                    FROM reviews r
+                    JOIN hotels h ON h.id = r.hotel_id
+                    WHERE r.id = %s
+                    """,
+                    (review_id,),
+                )
+                row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Không tìm thấy review.")
+        return clean_row(row)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/api/review-grades", tags=["Reviews"])
+def list_review_grades(hotel_id: Optional[int] = Query(None), grade_name: Optional[str] = Query(None)):
+    """Lấy toàn bộ trường của `review_grades`."""
+    clauses = []
+    params = []
+    if hotel_id is not None:
+        clauses.append("rg.hotel_id = %s")
+        params.append(hotel_id)
+    grade = clean_param(grade_name)
+    if grade:
+        clauses.append("rg.grade_name ILIKE %s")
+        params.append(f"%{grade}%")
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    f"""
+                    SELECT rg.*, h.name AS hotel_name, h.city AS hotel_city
+                    FROM review_grades rg
+                    JOIN hotels h ON h.id = rg.hotel_id
+                    {where_sql}
+                    ORDER BY rg.hotel_id, rg.grade_name
+                    """,
+                    tuple(params),
+                )
+                rows = [clean_row(row) for row in cur.fetchall()]
+        return {"data": rows}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/api/review-aspects", tags=["Reviews"])
+def list_review_aspects(hotel_id: Optional[int] = Query(None), aspect_name: Optional[str] = Query(None)):
+    """Lấy toàn bộ trường của `review_aspects`."""
+    clauses = []
+    params = []
+    if hotel_id is not None:
+        clauses.append("ra.hotel_id = %s")
+        params.append(hotel_id)
+    aspect = clean_param(aspect_name)
+    if aspect:
+        clauses.append("ra.aspect_name ILIKE %s")
+        params.append(f"%{aspect}%")
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    f"""
+                    SELECT ra.*, h.name AS hotel_name, h.city AS hotel_city
+                    FROM review_aspects ra
+                    JOIN hotels h ON h.id = ra.hotel_id
+                    {where_sql}
+                    ORDER BY ra.hotel_id, ra.mentioned DESC NULLS LAST, ra.aspect_name
+                    """,
+                    tuple(params),
+                )
+                rows = [clean_row(row) for row in cur.fetchall()]
+        return {"data": rows}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/api/text-chunks", tags=["Text Chunks"])
+def list_text_chunks(
+    hotel_id: Optional[int] = Query(None),
+    chunk_type: Optional[str] = Query(None),
+    include_embedding: bool = Query(False, description="Đặt true nếu cần trả embedding dạng text."),
+    page_limit: tuple[int, int, int] = Depends(pagination_params),
+):
+    """Lấy toàn bộ trường của `text_chunks`; embedding trả `null` mặc định để response nhẹ."""
+    page, limit, offset = page_limit
+    clauses = []
+    params = []
+    if hotel_id is not None:
+        clauses.append("tc.hotel_id = %s")
+        params.append(hotel_id)
+    chunk = clean_param(chunk_type)
+    if chunk:
+        clauses.append("tc.chunk_type = %s")
+        params.append(chunk)
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    embedding_select = "tc.embedding::text AS embedding" if include_embedding else "NULL AS embedding"
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(f"SELECT COUNT(*) AS count FROM text_chunks tc {where_sql}", tuple(params))
+                total = cur.fetchone()["count"]
+                cur.execute(
+                    f"""
+                    SELECT tc.id, tc.hotel_id, tc.chunk_type, tc.content, {embedding_select}, tc.metadata, tc.created_at,
+                           h.name AS hotel_name, h.city AS hotel_city
+                    FROM text_chunks tc
+                    JOIN hotels h ON h.id = tc.hotel_id
+                    {where_sql}
+                    ORDER BY tc.created_at DESC NULLS LAST, tc.id DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    tuple(params + [limit, offset]),
+                )
+                rows = [clean_row(row) for row in cur.fetchall()]
+        return paginated_response(total, page, limit, rows)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))

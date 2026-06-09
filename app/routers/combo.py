@@ -1,173 +1,141 @@
-from typing import Optional, List, Any
+from typing import Optional
+
 from fastapi import APIRouter, HTTPException, Query
 from psycopg2.extras import RealDictCursor
+
 from app.database import get_db_connection
+from app.helpers import clean_param, clean_row
 
 router = APIRouter()
 
-# 13. GET /api/hotels/combo-suggest
-@router.get("/api/hotels/combo-suggest", tags=["Combo"])
-def get_combo_suggest(
-    city: str,
-    budget_total: float,
-    guests: int = 2,
-    nights: int = 2,
-    suitable_for: Optional[str] = None,
-    min_occupancy: Optional[int] = None
-):
-    """Gợi ý combo khách sạn + hoạt động phù hợp ngân sách."""
-    try:
-        hotel_nights = max(1, nights - 1)
 
-        with get_db_connection() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                hotel_sql = "SELECT * FROM hotels WHERE city ILIKE %s"
-                hotel_params: List[Any] = [city]
-
-                if suitable_for:
-                    hotel_params.append([suitable_for.strip()])
-                    hotel_sql += " AND suitable_for @> %s::text[]"
-
-                cur.execute(hotel_sql, tuple(hotel_params))
-                hotels_list = cur.fetchall()
-
-                suggestions = []
-                for hotel in hotels_list:
-                    occupancy_need = min_occupancy if min_occupancy is not None else guests
-                    cur.execute(
-                        "SELECT * FROM rooms WHERE hotel_id = %s AND max_occupancy >= %s ORDER BY price ASC LIMIT 1",
-                        (hotel["id"], occupancy_need)
-                    )
-                    room = cur.fetchone()
-                    if not room or room["price"] is None:
-                        continue
-
-                    room_cost = float(room["price"]) * hotel_nights
-                    if room_cost > budget_total:
-                        continue
-
-                    cur.execute(
-                        "SELECT * FROM activities WHERE hotel_id = %s ORDER BY review_score DESC",
-                        (hotel["id"],)
-                    )
-                    activities = cur.fetchall()
-
-                    selected_acts = []
-                    total_act_cost = 0.0
-                    for act in activities:
-                        act_cost = float(act["price_amount"]) * guests
-                        if room_cost + total_act_cost + act_cost <= budget_total:
-                            selected_acts.append(act)
-                            total_act_cost += act_cost
-                            if len(selected_acts) >= 3:
-                                break
-
-                    total_cost = room_cost + total_act_cost
-                    suggestions.append({
-                        "hotel": {
-                            "id": hotel["id"],
-                            "name": hotel["name"],
-                            "star_rating": float(hotel["star_rating"]) if hotel["star_rating"] else None,
-                            "review_score": float(hotel["review_score"]) if hotel["review_score"] else None,
-                            "suitable_for": hotel["suitable_for"],
-                            "recommended_room": {
-                                "name": room["name"],
-                                "price": float(room["price"]),
-                                "max_occupancy": room["max_occupancy"]
-                            }
-                        },
-                        "activities": [
-                            {
-                                "id": a["id"],
-                                "title": a["title"],
-                                "description": a["description"],
-                                "price_amount": float(a["price_amount"]),
-                                "review_score": float(a["review_score"]) if a["review_score"] else None
-                            } for a in selected_acts
-                        ],
-                        "total_cost": total_cost,
-                        "remaining_budget": round(budget_total - total_cost, 2)
-                    })
-
-        if not suggestions:
-            raise HTTPException(status_code=404, detail="Không tìm thấy combo nào phù hợp ngân sách của bạn.")
-
-        suggestions.sort(key=lambda x: x["hotel"]["review_score"] or 0, reverse=True)
-        return suggestions[0]
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# 12. GET /api/hotels/{id}/combo — Tạo gói combo cho khách sạn
-@router.get("/api/hotels/{id}/combo", tags=["Combo"])
+@router.get("/api/hotels/{hotel_id}/combo", tags=["Combo"])
 def get_hotel_combo(
-    id: int,
-    nights: int = 3,
-    guests: int = 2,
-    include_activities: bool = True
+    hotel_id: int,
+    nights: int = Query(2, ge=1),
+    guests: int = Query(2, ge=1),
+    include_activities: bool = True,
 ):
-    """Tạo gợi ý gói combo khách sạn kèm hoạt động, tính tổng chi phí ước tính."""
+    """Tạo gói combo từ phòng rẻ nhất đáp ứng số khách và tối đa 3 hoạt động điểm cao."""
     try:
-        hotel_nights = max(1, nights - 1)
-
+        stay_nights = max(1, nights)
         with get_db_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(
-                    "SELECT id, name, star_rating, review_score FROM hotels WHERE id = %s",
-                    (id,)
-                )
+                cur.execute("SELECT * FROM hotels WHERE id = %s", (hotel_id,))
                 hotel = cur.fetchone()
                 if not hotel:
                     raise HTTPException(status_code=404, detail="Không tìm thấy khách sạn.")
-
                 cur.execute(
-                    "SELECT name, price, room_view FROM rooms WHERE hotel_id = %s ORDER BY price ASC LIMIT 1",
-                    (id,)
+                    "SELECT * FROM rooms WHERE hotel_id = %s AND COALESCE(max_occupancy, 0) >= %s ORDER BY price ASC NULLS LAST, id ASC LIMIT 1",
+                    (hotel_id, guests),
                 )
                 room = cur.fetchone()
                 if not room:
-                    raise HTTPException(status_code=404, detail="Khách sạn này chưa có dữ liệu phòng.")
-
-                activities_list = []
-                activities_cost = 0.0
+                    raise HTTPException(status_code=404, detail="Không tìm thấy phòng phù hợp số khách.")
+                activities = []
                 if include_activities:
                     cur.execute(
-                        "SELECT id, title, price_amount, review_score FROM activities WHERE hotel_id = %s ORDER BY review_score DESC LIMIT 3",
-                        (id,)
+                        "SELECT * FROM activities WHERE hotel_id = %s ORDER BY review_score DESC NULLS LAST, price_amount ASC NULLS LAST LIMIT 3",
+                        (hotel_id,),
                     )
-                    activities_list = cur.fetchall()
-                    activities_cost = sum(float(a["price_amount"]) for a in activities_list) * guests
-
-        room_cost = float(room["price"]) * hotel_nights
-        estimated_total = room_cost + activities_cost
-
+                    activities = cur.fetchall()
+        room_total = float(room["price"] or 0) * stay_nights
+        activities_total = sum(float(activity["price_amount"] or 0) for activity in activities) * guests
         return {
-            "hotel": {
-                "id": hotel["id"],
-                "name": hotel["name"],
-                "star_rating": float(hotel["star_rating"]) if hotel["star_rating"] else None,
-                "review_score": float(hotel["review_score"]) if hotel["review_score"] else None,
-                "recommended_room": {
-                    "name": room["name"],
-                    "price": float(room["price"]),
-                    "room_view": room["room_view"]
-                }
-            },
-            "activities": [
-                {
-                    "id": a["id"],
-                    "title": a["title"],
-                    "price_amount": float(a["price_amount"]),
-                    "review_score": float(a["review_score"]) if a["review_score"] else None
-                } for a in activities_list
-            ],
-            "estimated_total": round(estimated_total, 2)
+            "hotel": clean_row(hotel),
+            "room": clean_row(room),
+            "nights": stay_nights,
+            "guests": guests,
+            "activities": [clean_row(activity) for activity in activities],
+            "room_total": round(room_total, 2),
+            "activities_total": round(activities_total, 2),
+            "estimated_total": round(room_total + activities_total, 2),
         }
-
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/api/hotels/combo-suggest", tags=["Combo"])
+def suggest_combo(
+    city: str = Query(..., description="Thành phố muốn lưu trú."),
+    budget_total: float = Query(..., ge=0),
+    guests: int = Query(2, ge=1),
+    nights: int = Query(2, ge=1),
+    suitable_for: Optional[str] = Query(None, description="Tag trong hotel_suitability."),
+    limit: int = Query(5, ge=1, le=20),
+):
+    """Gợi ý combo khách sạn + phòng + hoạt động theo ngân sách."""
+    city_value = clean_param(city)
+    suitable_value = clean_param(suitable_for)
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                params = [f"%{city_value}%"]
+                suitable_clause = ""
+                if suitable_value:
+                    suitable_clause = "AND EXISTS (SELECT 1 FROM hotel_suitability hs WHERE hs.hotel_id = h.id AND hs.suitable_for_tag ILIKE %s)"
+                    params.append(f"%{suitable_value}%")
+                cur.execute(
+                    f"""
+                    SELECT h.*, r.id AS room_id, r.name AS room_name, r.price AS room_price,
+                           r.max_occupancy, r.room_view, r.bed_type
+                    FROM hotels h
+                    JOIN LATERAL (
+                        SELECT *
+                        FROM rooms
+                        WHERE rooms.hotel_id = h.id AND COALESCE(max_occupancy, 0) >= %s
+                        ORDER BY price ASC NULLS LAST, id ASC
+                        LIMIT 1
+                    ) r ON true
+                    WHERE h.city ILIKE %s
+                    {suitable_clause}
+                    ORDER BY h.review_score DESC NULLS LAST, r.price ASC NULLS LAST
+                    LIMIT %s
+                    """,
+                    tuple([guests] + params + [limit]),
+                )
+                candidates = cur.fetchall()
+                suggestions = []
+                for candidate in candidates:
+                    room_total = float(candidate["room_price"] or 0) * nights
+                    if room_total > budget_total:
+                        continue
+                    cur.execute(
+                        "SELECT * FROM activities WHERE hotel_id = %s ORDER BY review_score DESC NULLS LAST, price_amount ASC NULLS LAST",
+                        (candidate["id"],),
+                    )
+                    selected = []
+                    activity_total = 0.0
+                    for activity in cur.fetchall():
+                        price = float(activity["price_amount"] or 0) * guests
+                        if room_total + activity_total + price <= budget_total:
+                            selected.append(clean_row(activity))
+                            activity_total += price
+                        if len(selected) >= 3:
+                            break
+                    suggestions.append({
+                        "hotel": clean_row(candidate),
+                        "room": {
+                            "id": candidate["room_id"],
+                            "name": candidate["room_name"],
+                            "price": float(candidate["room_price"] or 0),
+                            "max_occupancy": candidate["max_occupancy"],
+                            "room_view": candidate["room_view"],
+                            "bed_type": candidate["bed_type"],
+                        },
+                        "activities": selected,
+                        "room_total": round(room_total, 2),
+                        "activities_total": round(activity_total, 2),
+                        "estimated_total": round(room_total + activity_total, 2),
+                        "remaining_budget": round(budget_total - room_total - activity_total, 2),
+                    })
+        if not suggestions:
+            raise HTTPException(status_code=404, detail="Không tìm thấy combo phù hợp ngân sách.")
+        return {"data": suggestions}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+

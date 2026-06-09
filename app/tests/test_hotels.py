@@ -121,3 +121,24 @@ def test_get_hotels_sorting_by_distance(client, mock_db):
     assert response.status_code == 200
     assert cursor.execute.called
 
+
+def test_get_hotels_backtick_cleaning(client, mock_db):
+    """Test 7: GET /api/hotels cleans backticks and quotes in query parameters."""
+    cursor = mock_db["cursor"]
+    cursor.fetchone.return_value = {"count": 1}
+    cursor.fetchall.return_value = []
+    
+    response = client.get(
+        "/api/hotels?city=`Da Nang`&amenities=`Wifi`,`Pool`",
+        headers={"X-API-Key": "ota_sk_test_token"}
+    )
+    assert response.status_code == 200
+    
+    # Verify mock db query matches cleaned args
+    call_args = cursor.execute.call_args_list
+    assert len(call_args) >= 1
+    count_query_params = call_args[0][0][1]
+    assert "Da Nang" in count_query_params
+    assert ["Wifi", "Pool"] in count_query_params
+
+
