@@ -1,12 +1,7 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Response
 
 router = APIRouter()
 
-@router.get("/health", tags=["System"])
+@router.api_route("/health", methods=["GET", "HEAD"], tags=["System"])
 def health_check():
-    """Kiểm tra trạng thái server. Không cần API Key."""
-    return {
-        "status": "OK",
-        "version": "2.0.0",
-        "message": "OTA Travel Assistant API đang hoạt động bình thường."
-    }
+    return Response(status_code=200)
